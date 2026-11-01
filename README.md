@@ -1,199 +1,322 @@
 # prodrafts2pdf
 
-Convierte notas de **Pro Drafts** (`.prodrafts`) a **PDF vectorial** o **SVG vectorial**, conservando la
-organización de carpetas y los nombres que tienen en la biblioteca de la app.
+**Convert [Pro Drafts](https://prodrafts.app) notes to vector PDF and SVG, keeping the names and folder structure you have in the app.**
 
-Los trazos del Apple Pencil se dibujan como trazados vectoriales (zoom ilimitado y editables en Illustrator,
-Affinity, Inkscape…), y el PDF de fondo de cada página se conserva tal cual.
+[Español](README.es.md)
 
-> Proyecto no oficial, sin relación con Pro Drafts ni con su desarrollador. El formato `.prodrafts` no está
-> documentado: este script se ha hecho observando notas reales, así que una versión futura de la app podría
-> cambiarlo. Revisa el resultado antes de borrar nada.
+Pro Drafts stores each note as an opaque `UUID.prodrafts` package. `prodrafts2pdf` reads that package and rebuilds
+the note as a standard file: Apple Pencil strokes become real vector paths (infinite zoom, editable in Illustrator,
+Affinity or Inkscape), the original PDF background is kept untouched, and the output lands in the same
+folder tree and under the same name you see in the app.
 
-## Qué hace
+> **Unofficial project.** Not affiliated with, or endorsed by, Pro Drafts or its developer. The `.prodrafts`
+> format is undocumented and was reverse-engineered from real notes, so a future app update may break it.
+> The tool never modifies your notes, but keep your own backups anyway.
 
-- **Una nota o toda la biblioteca.** Le pasas un `.prodrafts`, un `.zip` exportado o la carpeta con todas las notas.
-- **Nombre y carpetas reales.** Dentro de cada `.prodrafts` solo hay un UUID. El nombre ("Tema 7 - Exercicis en
-  paper") y las carpetas ("IC/Exercicis/…") están en la biblioteca de la app; el script los lee de ahí y recrea el
-  árbol en la salida.
-- **PDF para las notas normales.** Cada página lleva su PDF de fondo, los trazos, formas, imágenes (incluido HEIC),
-  cuadros de texto RTF con tablas y tarjetas de enlace.
-- **SVG para las notas de lienzo infinito** (formato antiguo de Pro Drafts, sin PDF de fondo).
-- **Solo lee el origen.** No escribe ni modifica nada en la carpeta de iCloud de las notas, y trabaja sobre una
-  copia temporal de la base de datos de la biblioteca.
-- **No repite trabajo.** Guarda una huella del contenido de cada nota y solo re-exporta las que han cambiado.
-- **Sin pisarse.** Si dos notas acaban con el mismo nombre en la misma carpeta, la segunda se llama `nombre (2)`.
+## Contents
 
-## Instalación
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Where are my notes?](#where-are-my-notes)
+- [Command-line reference](#command-line-reference)
+- [How it works](#how-it-works)
+- [Supported content](#supported-content)
+- [Platform support](#platform-support)
+- [Limitations](#limitations)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
 
-Necesitas Python 3 (probado con 3.12) y tres paquetes:
+## Features
+
+- **Vector output.** Strokes, shapes and text are vector objects, not images. PDFs keep the original background PDF of every page.
+- **Two output formats, chosen per note.** Notes with page backgrounds become **PDF**. Notes on an infinite canvas
+  (the older Pro Drafts format) become **SVG**.
+- **Single note or the whole library.** Pass one `.prodrafts` package, an exported `.zip`, or the folder that holds
+  all your notes.
+- **Real names and folders.** Resolves each note's UUID against the Pro Drafts library database and recreates the folder tree
+  (`IC/Exercicis/Tema 7 - Exercicis en paper.pdf`) under the output directory.
+- **Read-only on your data.** Your iCloud notes are only read. The library database is copied to a temporary
+  directory before it is queried.
+- **Incremental exports.** A content fingerprint per note means unchanged notes are skipped on later runs.
+- **Safe batch runs.** One broken note does not stop the batch, duplicate names never overwrite each other, and the
+  output directory can never be inside the source folder.
+- **Faithful rendering.** Variable-width strokes, translucent highlighters, erased and moved strokes, images (including
+  HEIC), RTF text boxes with tables, shapes and lines, link cards, and dark-paper pages.
+- **Few dependencies.** Three pure-Python-installable packages; everything else is the standard library.
+
+## Requirements
+
+### Python
+
+Python **3.8 or newer** (developed and tested on 3.12).
+
+### Python packages (required)
+
+| Package | Minimum | Used for |
+|---|---|---|
+| [`reportlab`](https://pypi.org/project/reportlab/) | 4.0 | Drawing the vector layer and writing PDF pages |
+| [`pypdf`](https://pypi.org/project/pypdf/) | 4.0 | Reading the background PDFs and merging them under the vector layer |
+| [`pillow`](https://pypi.org/project/pillow/) | 10.0 | Loading and converting embedded images |
+
+Tested with reportlab 4.4, pypdf 5.9 and Pillow 12.1. Everything else the script imports is part of the Python
+standard library (`sqlite3`, `plistlib`, `zipfile`, `hashlib`, `json`, ...).
+
+### Optional
+
+| What | Why | How |
+|---|---|---|
+| [`pillow-heif`](https://pypi.org/project/pillow-heif/) | Decode HEIC photos (iPhone images) embedded in notes | `python -m pip install pillow-heif` |
+| `pdftoppm` (Poppler) | Detect dark paper on scanned background PDFs that have no page fill. Without it that specific case is treated as light paper | macOS: `brew install poppler` · Debian/Ubuntu: `sudo apt install poppler-utils` · Windows: [Poppler builds](https://github.com/oschwartz10612/poppler-windows) on `PATH` |
+
+If `pillow-heif` is not installed, HEIC images are converted with the first available system tool: `sips` (macOS, built in),
+`heif-convert` (`libheif-examples` on Linux), ImageMagick (`magick` / `convert`) or `ffmpeg`. If none is found,
+that image is skipped with a warning and the rest of the note is still exported.
+
+## Installation
 
 ```sh
-git clone <url-del-repo>
+git clone https://github.com/<your-user>/prodrafts2pdf.git
 cd prodrafts2pdf
 
 python3 -m venv .venv
-source .venv/bin/activate          # Windows (PowerShell): .venv\Scripts\Activate.ps1
+source .venv/bin/activate            # Windows (PowerShell): .venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+
+# optional: HEIC support
+python -m pip install pillow-heif
 ```
 
-### ¿Puedo copiar el entorno (el `.venv`) desde mi Mac?
+> Do not copy a virtual environment between machines. A `venv` stores absolute paths and platform-specific compiled
+> wheels (for example Pillow), so it does not work on another OS, architecture or even another path.
+> Share `requirements.txt` and let each machine create its own environment, as above.
 
-No. Un entorno virtual **no es portable**: guarda rutas absolutas de tu máquina y paquetes compilados para tu
-sistema y arquitectura (por ejemplo Pillow). Copiarlo a otro Mac con otra ruta, a Linux o a Windows no funciona, y
-tampoco conviene subirlo a GitHub (está en el `.gitignore`).
-
-Lo que sí es multiplataforma es la **lista de dependencias** (`requirements.txt`): cada persona o máquina crea su
-propio entorno con los comandos de arriba.
-
-### Dependencias opcionales
-
-| Para qué | Qué instalar |
-|---|---|
-| Imágenes HEIC (fotos del iPhone dentro de las notas) | `python -m pip install pillow-heif`. En macOS, si no está, usa `sips`; en Linux, `heif-convert`, ImageMagick o `ffmpeg`. |
-| Detectar papel oscuro en PDFs escaneados | `pdftoppm` de Poppler (`brew install poppler` / `apt install poppler-utils`). Sin él, ese caso concreto se trata como papel claro. |
-
-## Uso
-
-### Una nota
+On macOS/Linux you can make the script executable and run it directly:
 
 ```sh
-python3 prodrafts2pdf.py nota.prodrafts.zip salida.pdf
+chmod +x prodrafts2pdf.py
+./prodrafts2pdf.py --help
 ```
 
-`nota` puede ser el `.zip` exportado o la carpeta `.prodrafts`. Con `salida.pdf` explícito se exporta siempre.
+The shebang uses `python3` from your `PATH`, so activate the virtual environment first or the packages will not be found.
+If a dependency is missing, the script says so once, with the exact install command for the interpreter it runs under,
+instead of failing note by note.
 
-Sin fichero de salida, usa el nombre y las carpetas de la biblioteca:
+## Quick start
+
+Convert one exported note, choosing the output file yourself:
+
+```sh
+python3 prodrafts2pdf.py note_prodrafts.zip note.pdf
+```
+
+Convert one note and let the library decide name and folders:
 
 ```sh
 python3 prodrafts2pdf.py 2131F525-4DFE-472E-9468-6925DEA840C6_prodrafts.zip --out-dir ~/Desktop/PDFs
 # -> ~/Desktop/PDFs/IC/Exercicis/Tema 7 - Exercicis en paper.pdf
 ```
 
-El UUID de la nota se toma del nombre del fichero o de la carpeta, así que no lo renombres antes de convertir.
-
-### Toda la biblioteca
+Export **all** your notes at once (macOS, notes synced through iCloud):
 
 ```sh
-python3 prodrafts2pdf.py ~/Library/Mobile\ Documents/iCloud~draft/Documents --out-dir ~/Desktop/PDFs
+python3 prodrafts2pdf.py "$HOME/Library/Mobile Documents/iCloud~draft/Documents" --out-dir "$HOME/Desktop/PDFs"
 ```
 
-Convierte cada `.prodrafts` y `.zip` de la carpeta y recrea el árbol de la biblioteca bajo `--out-dir`.
-`--out-dir` **no puede estar dentro de la carpeta de origen** (ni contenerla): así los PDF no se mezclan con las notas.
-Si una nota falla, el proceso sigue y al final se listan los fallos.
+See [Where are my notes?](#where-are-my-notes) for how to find that folder and what to change if yours is different.
 
-### Opciones
+Example result:
 
-| Opción | Efecto |
-|---|---|
-| `salida.pdf` / `salida.svg` | Fichero de salida. Si se omite, se usan el nombre y las carpetas de la biblioteca. |
-| `--out-dir DIR` | Carpeta raíz de la salida cuando no se da fichero (por defecto, la actual). |
-| `--db RUTA` | `MainDrawBoardFile.sqlite` de la biblioteca (por defecto, el del contenedor de Pro Drafts en macOS). |
-| `--force` | Re-exporta aunque la nota no haya cambiado. |
-| `--skip-existing` | (Modo carpeta) no rehace los ficheros que ya existen. |
-| `--width F` | Factor de grosor del trazo (por defecto 0.55, calibrado con las miniaturas de las notas). |
-| `--canvas-scale F` | Escala del lienzo a la página (por defecto 0.5). |
-| `--hide-masked` | Oculta por completo los trazos borrados que tengan algún rango, en lugar de quitar solo los tramos borrados. |
+```
+PDFs/
+├── .prodrafts2pdf.json            # fingerprints for incremental runs
+├── IC/
+│   ├── About IC.svg               # infinite-canvas note -> SVG
+│   └── Exercicis/
+│       └── Tema 7 - Exercicis en paper.pdf
+├── Física/
+│   └── Pràctiques/Pràctica 1/PR01-Previ.pdf
+└── _sin_biblioteca/               # notes missing from the library database
+    └── 86C7FDDF-E6B6-4870-92E4-C7BB8220DA66.pdf
+```
 
-## Cómo se decide el nombre y las carpetas
+> The note's UUID is read from the file or folder name (`<UUID>.prodrafts`, `<UUID>_prodrafts.zip`), so do not rename
+> notes before converting. Console messages are in Spanish.
 
-La app guarda su biblioteca en `MainDrawBoardFile.sqlite`. En macOS está en:
+## Where are my notes?
+
+The path you pass as `SRC` to export everything is the folder that holds one `<UUID>.prodrafts` package per note.
+
+**macOS with iCloud sync (the usual case):**
+
+```
+~/Library/Mobile Documents/iCloud~draft/Documents
+```
+
+It contains entries like `036452E6-C7E7-48CC-9E99-F00B73AC8F81.prodrafts`, one per note. To check it, open Terminal and run:
+
+```sh
+ls "$HOME/Library/Mobile Documents/iCloud~draft/Documents" | head
+```
+
+or, in Finder, press `Shift + Cmd + G` and paste the path. Then export everything:
+
+```sh
+python3 prodrafts2pdf.py "$HOME/Library/Mobile Documents/iCloud~draft/Documents" --out-dir "$HOME/Desktop/PDFs"
+```
+
+Notes:
+
+- Keep the path **in double quotes**: `Mobile Documents` contains a space. Use `"$HOME/..."` instead of `~/...`,
+  because `~` is not expanded inside quotes.
+- Choose an `--out-dir` **outside** that folder (the script refuses otherwise), such as `~/Desktop/PDFs`.
+- If some notes are not fully downloaded from iCloud, they may be reported as failures. Open the folder in Finder,
+  let iCloud finish, and run the command again; notes already exported are skipped.
+- If your notes are somewhere else (a copy on another disk, exports from another device), pass that folder instead.
+  Any folder that directly contains `.prodrafts` packages or `.zip` exports works.
+
+**Library database** (names and folders), used automatically on macOS:
 
 ```
 ~/Library/Containers/emmo.prodrafts/Data/Library/Application Support/Prodrafts/MainDrawBoardFile.sqlite
 ```
 
-La tabla `ZBOARDFILE` tiene una fila por nota y por carpeta, con `ZNAME` (nombre), `ZUUID` (el UUID del
-`.prodrafts`) y `ZFATHERFILE` (la fila de la carpeta padre). El script busca la nota por UUID y sube por los padres
-hasta la primera carpeta para construir la ruta.
+On another computer, copy that file (and its `-wal` and `-shm` companions) and add `--db /path/to/MainDrawBoardFile.sqlite`.
 
-- Se copian a un directorio temporal la base de datos y sus ficheros `-wal` y `-shm`; el original no se abre.
-- Los caracteres `/` y `:` de los nombres se sustituyen por `-`.
-- Las notas que no aparecen en la biblioteca van a `_sin_biblioteca/<UUID>`.
-- Si no se encuentra la base de datos, avisa y usa el UUID como nombre.
+## Command-line reference
 
-En macOS, leer `~/Library/Containers` puede requerir dar **Acceso total al disco** a tu Terminal
-(Ajustes del Sistema → Privacidad y seguridad). Si ves `Operation not permitted`, es eso.
+```
+prodrafts2pdf.py SRC [OUT] [--out-dir DIR] [--db FILE] [--force] [--skip-existing]
+                     [--width F] [--canvas-scale F] [--hide-masked]
+```
 
-## Detección de cambios
+| Argument | Description |
+|---|---|
+| `SRC` | A `.prodrafts` folder, a `.zip` export, or a folder containing many of them (batch mode). |
+| `OUT` | Output file (`.pdf`, or `.svg` for infinite-canvas notes). If omitted, name and folders come from the library. Always exports. Not allowed in batch mode (use `--out-dir`). |
+| `--out-dir DIR` | Root of the generated tree when `OUT` is omitted. Defaults to the current directory. In batch mode it may not be inside `SRC` or contain it. |
+| `--db FILE` | Pro Drafts library database (`MainDrawBoardFile.sqlite`). Defaults to the macOS app container path. |
+| `--force` | Re-export even if the note is unchanged. |
+| `--skip-existing` | Batch mode: skip any note whose output file already exists, changed or not. |
+| `--width F` | Stroke width factor (default `0.55`, calibrated against the notes' own thumbnails). |
+| `--canvas-scale F` | Canvas-to-page scale (default `0.5`). |
+| `--hide-masked` | Hide fully any stroke that has an edit range, instead of removing only the erased segments. |
 
-En `--out-dir` se crea `.prodrafts2pdf.json`, con la huella (SHA-1) de cada nota exportada y la ruta de su salida.
-Una nota se omite si coinciden la huella y la ruta y el fichero existe. La huella incluye:
+## How it works
 
-- el contenido de la nota, salvo `search/` y `.DS_Store` (cuenta el contenido, no las fechas, así que iCloud tocando
-  fechas no fuerza nada);
-- los ajustes `--width`, `--canvas-scale` y `--hide-masked`;
-- el propio código del script: si lo actualizas, la siguiente pasada re-exporta todo.
+```
+ .prodrafts package ──► parse pages, strokes, shapes, text, images
+        │                                   │
+        │                                   ▼
+        │                    apply erase / move records, detect dark paper
+        │                                   │
+        ▼                                   ▼
+ library database ──► name + folder   vector drawing  ──► PDF (page background + vector layer)
+ (read-only copy)      path                              └► SVG (infinite canvas)
+```
 
-Si renombras o mueves una nota en Pro Drafts, la ruta cambia y se exporta a la nueva. El fichero de la ruta
-antigua **no se borra**. Si el proceso se interrumpe, el manifiesto se guarda tras cada nota y al relanzar continúa.
+1. **Open the package.** A `.zip` is extracted to a temporary directory; a folder is read in place. The format is
+   detected by its files (see [Supported content](#supported-content)).
+2. **Parse the drawing.** The binary drawing file is decoded into strokes with their points, widths and colors.
+   Records of erased and moved strokes are applied so the page looks like it does in the app.
+3. **Read the items.** Shapes, text boxes, images and link cards come from the note's SQLite database
+   (`ZDRAFTBOARDITEM`), with their frame, rotation and opacity.
+4. **Detect the paper.** Dark pages are turned into white paper with neutrals inverted; colors are kept.
+5. **Draw.** Everything is drawn through one drawing layer, which writes either a reportlab PDF canvas or an SVG canvas
+   with the same calls, so both outputs match. PDF pages are merged over the original background page with pypdf.
+6. **Resolve name and folders.** The note's UUID is looked up in the library database (`ZBOARDFILE`: `ZNAME`,
+   `ZUUID`, `ZFATHERFILE`), and parents are followed up to the first folder. The database, plus its `-wal` and `-shm`
+   files, is copied to a temporary directory first, once per run.
+7. **Skip what has not changed.** A SHA-1 fingerprint (note contents, rendering options, and the script itself) is
+   stored in `.prodrafts2pdf.json` inside `--out-dir`, written after every note so interrupted runs resume.
 
-## Formatos de entrada
+### Where the library lives
 
-**Formato actual** (páginas con PDF de fondo):
+On macOS the database is:
+
+```
+~/Library/Containers/emmo.prodrafts/Data/Library/Application Support/Prodrafts/MainDrawBoardFile.sqlite
+```
+
+Reading it may require granting your terminal **Full Disk Access** (System Settings → Privacy & Security).
+Names and folders are not stored inside the `.prodrafts` package, which is why this database is needed.
+If it cannot be found, the script warns and falls back to the UUID as the file name.
+
+Characters that are invalid in file names (`/`, `:`) are replaced with `-`. Duplicate names in the same folder get a
+` (2)`, ` (3)` suffix, compared case-insensitively as macOS does.
+
+## Supported content
+
+**Current format** (pages with PDF backgrounds):
 
 ```
 <UUID>.prodrafts/
 ├── meta.plist
-├── pageIndex.plist            # páginas en orden y PDF de fondo de cada una
-├── drawings/*.com.apple.drawing   # trazos de cada página
-├── attachments/               # PDF de fondo, imágenes (PNG, HEIC…)
-├── note.database.sqlite       # formas, texto RTF, imágenes colocadas (ZDRAFTBOARDITEM)
+├── pageIndex.plist                 page order and background PDF of each page
+├── drawings/*.com.apple.drawing    strokes of each page
+├── attachments/                    background PDFs, images (PNG, HEIC, ...)
+├── note.database.sqlite            shapes, RTF text, placed images
 ├── thumbnail.jpeg
 └── search/
 ```
 
-**Formato antiguo** (lienzo infinito, una sola página): `draw.data`, `draft.database.sqlite`,
-`draft.data.model` y `File/`, sin `pageIndex.plist`. La página se calcula como la caja que ocupa el contenido
-más un margen, y el resultado sale en SVG.
+**Legacy format** (single-page infinite canvas): `draw.data`, `draft.database.sqlite`, `draft.data.model` and `File/`.
+There is no background page, so the page is sized to the bounding box of the content plus a margin and exported as SVG.
 
-## Cómo se dibuja
-
-- **Trazos.** Se leen del fichero de dibujo y se pintan con ancho variable según la presión. Los marcadores
-  translúcidos conservan su transparencia.
-- **Borrados y movidos.** Los trazos con registro de edición se interpretan para quitar los tramos borrados y dibujar
-  los movidos en su sitio.
-- **Fondo oscuro.** Si el papel de la página es oscuro, se pasa a papel blanco invirtiendo los neutros (blanco a
-  negro) y se respetan los colores.
-- **Texto.** Los cuadros de texto RTF se dibujan como texto real, con tablas.
-- **Imágenes.** PNG, JPEG y HEIC, con su posición, giro y opacidad.
-- **Tarjetas de enlace.** Se dibujan como tarjeta con título y dominio; el icono guardado es de 16 px y no se estira.
-- **PDF.** Cada página: PDF de fondo + capa vectorial encima.
-- **SVG.** Los trazados se escriben ya con coordenadas de la página (sin los números enormes del lienzo, que dan
-  problemas de precisión en algunos visores); texto e imágenes llevan su matriz. Lleva un rectángulo blanco
-  `id="fondo"` que puedes borrar si lo quieres transparente.
-
-## Multiplataforma
-
-| Parte | macOS | Linux | Windows |
-|---|---|---|---|
-| El script (Python y los tres paquetes) | Sí | Sí | Sí |
-| Leer el nombre y las carpetas desde la app | Directo (ruta por defecto) | Copia `MainDrawBoardFile.sqlite` (y `-wal`, `-shm`) y usa `--db` | Igual que Linux |
-| Tener las notas `.prodrafts` | iCloud Drive: `~/Library/Mobile Documents/iCloud~draft/Documents` | Cópialas desde el Mac | Cópialas desde el Mac |
-
-La biblioteca solo existe en los dispositivos Apple donde corre Pro Drafts. En otros sistemas el script funciona,
-pero necesitas llevar las notas y la base de datos desde el Mac.
-
-## Limitaciones conocidas
-
-- Formato no oficial: puede dejar de funcionar con versiones nuevas de la app.
-- Las constantes de grosor y escala están calibradas contra notas concretas; si el trazo sale más fino o más
-  grueso de lo esperado, ajusta `--width` y `--canvas-scale`.
-- Algunos elementos de la app (por ejemplo ciertos tipos de formas o mapas mentales) pueden no estar soportados.
-  Si alguno falta en tu salida, abre un issue con una nota de ejemplo.
-- Una nota sin `pageIndex.plist` ni `draw.data` no se puede convertir y aparece en la lista de fallos.
-- En el SVG, la tipografía es Helvetica/Arial del sistema, no la de la nota.
-
-## Solución de problemas
-
-| Mensaje | Qué pasa |
+| Content | Support |
 |---|---|
-| `Faltan dependencias para …` | Falta algún paquete en el Python que ejecuta el script. Usa el comando que muestra, o activa el entorno virtual. |
-| `no encuentro la nota en la biblioteca` | No se encontró la base de datos o la nota no está en ella. Usa `--db` o revisa que el nombre del fichero conserve el UUID. |
-| `Operation not permitted` | En macOS, da acceso total al disco a la Terminal. |
-| `No encuentro pageIndex.plist ni draw.data` | La carpeta no es una nota completa (a veces pasa con notas aún sin descargar de iCloud). |
-| Todo se re-exporta cada vez | Cambia la huella: cambió el script, los ajustes o el contenido. Mira si `.prodrafts2pdf.json` está en `--out-dir`. |
+| Pencil strokes | Vector, variable width, translucent highlighters |
+| Eraser and moved strokes | Erased segments removed, moved strokes drawn in place |
+| Background PDFs | Preserved as the page background |
+| Images | PNG, JPEG, HEIC, with position, rotation and opacity |
+| Text boxes | RTF as real text, including tables |
+| Shapes and lines | Fills, borders, dashes, rounded corners |
+| Link cards | Drawn as a card with title and domain |
+| Dark paper | Converted to white paper with neutrals inverted |
 
-## Licencia
+SVG output uses page-sized coordinates for paths (not the huge raw canvas coordinates, which lose precision in some
+viewers), carries a matrix on text and images, and includes a white rectangle with `id="fondo"` that you can delete
+for a transparent background. Text is set in Helvetica/Arial from the viewer's system fonts.
 
-Añade aquí la licencia que prefieras (por ejemplo MIT).
+## Platform support
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| Script and Python packages | Tested | Tested | Not tested; expected to work (pure Python + wheels) |
+| Name/folder lookup | Automatic (default path) | Copy `MainDrawBoardFile.sqlite` (and `-wal`, `-shm`) from a Mac and pass `--db` | Same as Linux |
+| Getting the notes | iCloud Drive: `~/Library/Mobile Documents/iCloud~draft/Documents` | Copy them from a Mac | Copy them from a Mac |
+
+The library only exists on the Apple devices where Pro Drafts runs, so on other systems you bring the notes and the
+database over from a Mac.
+
+## Limitations
+
+- Unofficial, reverse-engineered format; app updates can break it.
+- Stroke width and canvas scale are calibrated against specific notes. If strokes look thinner or thicker than in the app,
+  adjust `--width` and `--canvas-scale`.
+- Some app features (for example certain shape types or mind maps) may not be supported. Open an issue with a sample note.
+- A package with neither `pageIndex.plist` nor `draw.data` (for example one not fully downloaded from iCloud) cannot be converted and is reported as a failure.
+- Moving or renaming a note in the app produces a new output path; the old file is not deleted.
+- Console messages and some output names (`_sin_biblioteca`, SVG `fondo` id) are in Spanish.
+
+## Troubleshooting
+
+| Message / symptom | Cause and fix |
+|---|---|
+| `Faltan dependencias para ...` | A required package is missing in the Python that runs the script. Run the printed `pip install` command, or activate your virtual environment. |
+| `no encuentro la nota en la biblioteca` | Database not found, or the note is not in it. Pass `--db`, and keep the UUID in the file name. |
+| `Operation not permitted` (macOS) | Give your terminal Full Disk Access. |
+| `No encuentro pageIndex.plist ni draw.data` | The folder is not a complete note (for example, not fully downloaded from iCloud). |
+| Everything is re-exported every time | The fingerprint changed: the script, the rendering options or the note changed. Check that `.prodrafts2pdf.json` is present in `--out-dir`. |
+| HEIC images are missing | Install `pillow-heif`, or make sure `sips`, `heif-convert`, ImageMagick or `ffmpeg` is available. |
+
+## Contributing
+
+Issues and pull requests are welcome. When reporting a rendering problem, a small sample note (or its zip export)
+and a screenshot of how it looks in Pro Drafts make it much easier to reproduce. Please remove any personal content first.
+
+## License
+
+Add your license here (for example MIT) and include a `LICENSE` file in the repository.
