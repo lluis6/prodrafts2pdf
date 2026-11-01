@@ -78,7 +78,7 @@ that image is skipped with a warning and the rest of the note is still exported.
 ## Installation
 
 ```sh
-git clone https://github.com/<your-user>/prodrafts2pdf.git
+git clone https://github.com/lluis6/prodrafts2pdf.git
 cd prodrafts2pdf
 
 python3 -m venv .venv
