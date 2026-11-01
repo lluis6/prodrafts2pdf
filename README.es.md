@@ -78,7 +78,7 @@ Si no hay ninguna, esa imagen se omite con un aviso y el resto de la nota se exp
 ## Instalación
 
 ```sh
-git clone https://github.com/<tu-usuario>/prodrafts2pdf.git
+git clone https://github.com/lluis6/prodrafts2pdf.git
 cd prodrafts2pdf
 
 python3 -m venv .venv
