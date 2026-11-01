@@ -1,4 +1,5 @@
-reportlab
-pypdf
-pillow
-pillow-heif
+reportlab>=4.0
+pypdf>=4.0
+pillow>=10.0
+# opcional (fotos HEIC):
+# pillow-heif
