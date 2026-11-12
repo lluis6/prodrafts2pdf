@@ -779,14 +779,53 @@ def draw_image_item(c, it, root, H, ox, oy):
     c.drawImage(ImageReader(im), -w / 2, -h / 2, w, h, mask='auto')
     c.restoreState()
 
-def draw_link_card(c, it):
-    """Tarjeta de enlace (ZTYPE 13): el icono guardado es un favicon de 16 px, así que no se estira; se dibuja
-       una tarjeta redondeada con el título (hasta 2 líneas) y el dominio."""
+_ICON_CACHE = {}
+
+def _rounded_icon(path, size=96):
+    """Favicon de la tarjeta (16 px) -> cuadrado redondeado suave, como lo muestra Pro Drafts. None si no se puede leer."""
+    if path in _ICON_CACHE:
+        return _ICON_CACHE[path]
+    from PIL import Image, ImageDraw
+    im = load_image(path); out = None
+    if im is not None:
+        bg = Image.new('RGBA', im.size, (255, 255, 255, 255)); bg.alpha_composite(im)     # transparencias sobre blanco
+        inner = int(size * 0.83)                       # el logo no llena el cuadrado: lleva margen blanco, como en Pro Drafts
+        big = Image.new('RGBA', (size, size), (255, 255, 255, 255))
+        big.alpha_composite(bg.resize((inner, inner), Image.LANCZOS), ((size - inner) // 2, (size - inner) // 2))
+        mask = Image.new('L', (size * 4, size * 4), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, size * 4 - 1, size * 4 - 1), radius=size * 4 * 0.22, fill=255)
+        big.putalpha(mask.resize((size, size), Image.LANCZOS)); out = big
+    _ICON_CACHE[path] = out
+    return out
+
+def _globe(c, cx, cy, r, col):
+    """Iconito de globo (gris) que Pro Drafts pone junto al dominio."""
     from reportlab.lib.colors import Color
+    c.setStrokeColor(Color(*col)); c.setLineWidth(max(r * 0.18, 0.4))
+    c.circle(cx, cy, r, stroke=1, fill=0)
+    c.line(cx - r, cy, cx + r, cy)
+    k = 0.5523 * r * 0.45; rx = r * 0.45
+    p = c.beginPath(); p.moveTo(cx, cy + r)
+    p.curveTo(cx + rx + k, cy + r * 0.6, cx + rx + k, cy - r * 0.6, cx, cy - r)
+    p.curveTo(cx - rx - k, cy - r * 0.6, cx - rx - k, cy + r * 0.6, cx, cy + r)
+    c.drawPath(p, stroke=1, fill=0)
+
+def draw_link_card(c, it, root=None):
+    """Tarjeta de enlace (ZTYPE 13), como en Pro Drafts: icono de la web (favicon de 16 px, suavizado y con esquinas
+       redondeadas) centrado arriba, título (hasta 2 líneas) y, abajo, globo + dominio.
+       En SVG todo va dentro de un <a> con el enlace."""
+    from reportlab.lib.colors import Color
+    from reportlab.lib.utils import ImageReader
     from reportlab.pdfbase.pdfmetrics import stringWidth
     x, y, w, h = it['frame']
     a, b, cc, d, _, _ = it['tr']
     cx, cy = it['center'] or (x + w / 2, y + h / 2)
+    url = (it.get('url') or '').strip()
+    icon = None
+    if root and it.get('image'):
+        icon = _rounded_icon(next((q for q in (os.path.join(root, dd, it['image']) for dd in ('attachments', 'File')) if os.path.isfile(q)), ''))
+    if url and hasattr(c, 'begin_link'):          # solo SVG
+        c.begin_link(url)
     c.saveState()
     c.translate(cx, -cy); c.transform(a, -b, -cc, d, 0, 0)
     r = min(it.get('radius') or 14.0, w / 2, h / 2)
@@ -807,15 +846,25 @@ def draw_link_card(c, it):
         while lines[1] and stringWidth(lines[1] + '...', 'Helvetica-Bold', fs) > w - 2 * pad:
             lines[1] = lines[1][:-1]
         lines[1] += '...'
+    yy = h / 2 - pad - fs                      # sin icono: título pegado arriba
+    if icon is not None:
+        side = min(0.38 * h, 0.30 * w); top = h / 2 - 0.06 * h
+        c.drawImage(ImageReader(icon), -side / 2, top - side, side, side, mask='auto')
+        yy = top - side - 0.08 * h - fs
     col = map_rgb(0.1, 0.1, 0.1); c.setFillColor(Color(*col)); c.setFont('Helvetica-Bold', fs)
-    yy = h / 2 - pad - fs
     for ln in lines:
         c.drawString(-w / 2 + pad, yy, ln); yy -= fs * 1.25
     m = _re.match(r'https?://([^/]+)', it.get('url') or '')
     if m:
-        c.setFont('Helvetica', fs * 0.8); c.setFillColor(Color(*map_rgb(0.4, 0.4, 0.4)))
-        c.drawString(-w / 2 + pad, -h / 2 + pad, m.group(1)[:60])
+        dfs = fs * 0.8; gr = dfs * 0.42; gray = map_rgb(0.4, 0.4, 0.4)
+        _globe(c, -w / 2 + pad + gr, -h / 2 + pad + dfs * 0.3, gr, gray)
+        c.setFont('Helvetica', dfs); c.setFillColor(Color(*gray))
+        c.drawString(-w / 2 + pad + 2 * gr + dfs * 0.35, -h / 2 + pad, m.group(1)[:60])
+    if url and hasattr(c, 'linkURL'):             # solo PDF: anotación de enlace sobre toda la tarjeta (sigue la transformación)
+        c.linkURL(url, (-w / 2, -h / 2, w / 2, h / 2), relative=1, thickness=0)
     c.restoreState()
+    if url and hasattr(c, 'end_link'):
+        c.end_link()
 
 def draw_item(c, it, H, ox, oy):
     from reportlab.lib.colors import Color
@@ -961,7 +1010,7 @@ def safe_name(s):
 _LIB_CACHE = {}
 
 def _load_library(db):
-    """Copia temporal de la biblioteca (+ -wal/-shm), leída una sola vez: ({pk: (nombre, padre)}, {uuid_hex: pk}) o None."""
+    """Copia temporal de la biblioteca (+ -wal/-shm), leída una sola vez: ({pk: (nombre, padre)}, {uuid_hex: pk}, {pk eliminados}) o None."""
     import sqlite3, shutil
     if db in _LIB_CACHE:
         return _LIB_CACHE[db]
@@ -976,8 +1025,18 @@ def _load_library(db):
             con = sqlite3.connect(cp)
             rows = {r[0]: (r[1], r[2]) for r in con.execute('select Z_PK, ZNAME, ZFATHERFILE from ZBOARDFILE')}
             ids = {bytes(r[1]).hex(): r[0] for r in con.execute('select Z_PK, ZUUID from ZBOARDFILE where ZUUID is not null')}
+            # Eliminados: ZISDELETE=1 (en la papelera) o ZNEEDDELETE=1 (borrado pendiente de sincronizar)
+            cols = [r[1] for r in con.execute('pragma table_info(ZBOARDFILE)')]
+            dcols = [c for c in ('ZISDELETE', 'ZNEEDDELETE') if c in cols]
+            deleted = set()
+            if dcols:
+                for r in con.execute('select Z_PK, %s from ZBOARDFILE' % ', '.join(dcols)):
+                    if any(v not in (None, 0, 0.0, '') for v in r[1:]):
+                        deleted.add(r[0])
+            else:
+                print("aviso: ZBOARDFILE no tiene ZISDELETE; las notas eliminadas no se distinguirán", file=sys.stderr)
             con.close()
-            res = (rows, ids)
+            res = (rows, ids, deleted)
         except Exception as e:
             print("aviso: no puedo leer la biblioteca de Pro Drafts (%s)" % e, file=sys.stderr)
         finally:
@@ -991,18 +1050,23 @@ def library_path(uuid_str, db=None):
     lib = _load_library(db or DEFAULT_DB) if uuid_str else None
     if not lib:
         return None
-    rows, ids = lib
+    rows, ids, deleted = lib
     pk0 = ids.get(uuid_str.replace('-', '').lower())
     if pk0 is None or not safe_name(rows[pk0][0]):
         return None
     name = safe_name(rows[pk0][0])
+    is_del = pk0 in deleted
     folders, seen, pk = [], {pk0}, rows[pk0][1]
     while pk and pk in rows and pk not in seen:
         seen.add(pk)
+        is_del = is_del or pk in deleted      # dentro de una carpeta eliminada
         nm, pk = rows[pk]
         if safe_name(nm):
             folders.append(safe_name(nm))
-    return folders[::-1], name
+    folders = folders[::-1]
+    if is_del:
+        folders = ['Eliminados'] + folders    # conserva la ruta original dentro de Eliminados/
+    return folders, name
 
 def default_out(src, out_dir, db=None, ext='.pdf'):
     uid = note_uuid(src)
@@ -1144,6 +1208,13 @@ class SvgCanvas:
         op = '' if self.st['fa'] >= 0.999 else ' opacity="%.3f"' % self.st['fa']
         self.out.append('<image transform="matrix(%s)" x="%s" y="%s" width="%s" height="%s" preserveAspectRatio="none"%s xlink:href="data:%s;base64,%s"/>'
                         % (self._matrix_flipped(), _n(x), _n(-(y + h)), _n(w), _n(h), op, mime, base64.b64encode(buf.getvalue()).decode()))
+    # --- enlaces web: lo dibujado entre begin_link() y end_link() es clicable (<a>) en el SVG
+    def begin_link(self, url):
+        from xml.sax.saxutils import quoteattr
+        u = quoteattr(url)
+        self.out.append('<a href=%s xlink:href=%s target="_blank"><title>%s</title>' % (u, u, u[1:-1]))
+    def end_link(self):
+        self.out.append('</a>')
     def background(self, rgb=(1, 1, 1)):
         self.out.append('<rect id="fondo" width="%s" height="%s" fill="%s"/>' % (_n(self.W), _n(self.H), _hex(rgb)))
     def tostring(self):
@@ -1224,7 +1295,7 @@ def convert(src, out):
         c.saveState(); c.translate(tx, H0 - ty); c.scale(sc, sc)   # a partir de aquí: coordenadas del dibujo, y hacia arriba = -y
         for it in items:
             if it.get('type') == 13 and (it.get('title') or it.get('url')):
-                draw_link_card(c, it)
+                draw_link_card(c, it, root)
             elif it.get('image'):
                 draw_image_item(c, it, root, 0, 0, 0)
             else:
@@ -1338,6 +1409,11 @@ def convert_all(src, out_dir, db=None, skip_existing=False, force=False):
         try:
             os.makedirs(os.path.dirname(out), exist_ok=True)
             convert(path, out); ok += 1
+            prev = (manifest.get(key) or {}).get('out')
+            if prev:
+                oldp = os.path.join(out_dir, prev)
+                if os.path.abspath(oldp).lower() != os.path.abspath(out).lower() and os.path.join(out_dir, prev).lower() not in used and os.path.isfile(oldp):
+                    os.remove(oldp); print("  ruta antigua eliminada: %s" % prev)
             manifest[key] = {'fp': fp, 'out': os.path.relpath(out, out_dir)}
             save_manifest(out_dir, manifest)
         except (Exception, SystemExit) as e:
