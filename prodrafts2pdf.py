@@ -339,6 +339,15 @@ def board_items(root, page_uuid, legacy=False):
                 return (d['UIRed'], d['UIGreen'], d['UIBlue'], d.get('UIAlpha', 1.0))
             # color en escala de grises (p.ej. whiteColor): solo trae UIWhite + UIAlpha
             return (d['UIWhite'], d['UIWhite'], d['UIWhite'], d.get('UIAlpha', 1.0))
+        bsz = None          # tamaño real (sin girar ni escalar): el 'frame' de un elemento girado es su caja envolvente
+        try:
+            bo = ka(r['ZBOUNDS']) if r.get('ZBOUNDS') else None
+            sb_ = next(x for x in (bo or []) if isinstance(x, str) and x.startswith('{'))
+            nb = [float(x) for x in re.findall(r'-?\d+(?:\.\d+)?(?:e-?\d+)?', sb_)]
+            if len(nb) == 4 and nb[2] > 0 and nb[3] > 0:
+                bsz = (nb[2], nb[3])
+        except Exception:
+            pass
         tr = (1, 0, 0, 1, 0, 0)
         try:
             to = plistlib.loads(r['ZTRANSFORMVALUE'])['$objects']
@@ -362,11 +371,29 @@ def board_items(root, page_uuid, legacy=False):
                     pts_[key] = tuple(float(v) for v in re.findall(r'-?\d+(?:\.\d+)?(?:e-?\d+)?', sp))[:2]
                 except Exception:
                     pass
-        out.append({'line': pts_ if len(pts_) == 2 else None, 'dash': (r.get('ZLINEDASHWIDTH') or 0, r.get('ZLINEDASHSPACE') or 0) if r.get('ZLINETYPE') else None,
-                    'cap': r.get('ZLINECAP'), 'type': r.get('ZTYPE'), 'title': r.get('ZNAME'), 'url': r.get('ZLINKURL'), 'frame': nums, 'image': r.get('ZFILENAME') or None, 'tr': tr, 'center': ctr,
+        grid = None
+        if r.get('ZTYPE') == 9 and r.get('ZGRID'):          # tabla de Pro Drafts (TableGrid): filas de celdas con ancho/alto
+            try:
+                go = plistlib.loads(r['ZGRID'])['$objects']
+                def _res(v):
+                    import plistlib as _pl
+                    return go[v.data] if isinstance(v, _pl.UID) else v
+                rows_ = []
+                for ru in _res(go[1]['rows'])['NS.objects']:
+                    cells_ = []
+                    for cu in _res(_res(ru)['cells'])['NS.objects']:
+                        cd = _res(cu)
+                        cells_.append((float(_res(cd['w'])), float(_res(cd['h']))))
+                    rows_.append(cells_)
+                grid = rows_
+            except Exception as e:
+                print("  aviso: no puedo leer la tabla (%s)" % e, file=sys.stderr)
+        out.append({'grid': grid, 'line': pts_ if len(pts_) == 2 else None, 'dash': (r.get('ZLINEDASHWIDTH') or 0, r.get('ZLINEDASHSPACE') or 0) if r.get('ZLINETYPE') else None,
+                    'cap': r.get('ZLINECAP'), 'type': r.get('ZTYPE'), 'title': r.get('ZNAME'), 'url': r.get('ZLINKURL'), 'frame': nums, 'bounds': bsz, 'image': r.get('ZFILENAME') or None, 'tr': tr, 'center': ctr,
                     'alpha': r['ZALPHA'] if r.get('ZALPHA') is not None else 1.0,
                     'fill': col('ZFILLCOLOR') if r.get('ZFILLCOLORENABLE') else None,
                     'stroke': col('ZSTOKECOLOR') if r.get('ZSTOKECOLORENABLE') else None,
+                    'border': col('ZBORDERCOLOR'), 'bw': r.get('ZBORDERWIDTH') or 0, 'round': r.get('ZISROUNDCORNER'),
                     'lw': r.get('ZLINEWIDTH') or 0, 'radius': r.get('ZCORNERRADIUS') or 0,
                     'rtf': r['ZATTRIBUTEDTEXT'] if r.get('ZTYPE') == 4 and r.get('ZATTRIBUTEDTEXT') else None,
                     'order': r.get('ZZLEVEL') or 0})
@@ -379,6 +406,7 @@ def board_items(root, page_uuid, legacy=False):
 # Detalles del formato:
 #   - los acentos van como bytes \'hh en la codificación del tipo de letra: PingFang SC (\fcharset134) => GBK, no cp1252.
 #   - la fuente real (PingFang SC) no está disponible: se sustituye por Helvetica (métricas parecidas).
+TEXT_INSET_Y = 8.7   # margen superior real del cuadro de texto (medido contra una captura de Pro Drafts: ~3.7 más que el lateral)
 TEXT_INSET = 5.0     # margen del cuadro (unidades de lienzo): coincide con el relleno de línea de Cocoa
 LINE_HEIGHT = 1.4    # interlineado de PingFang SC (x tamaño de letra), medido sobre el cuadro de texto de la página 4
 CELL_PAD = 3.0       # margen horizontal del texto dentro de una celda
@@ -405,11 +433,18 @@ def rtf_extract(blob):
 _RTF_SKIP = {'stylesheet', 'info', 'pict', 'header', 'footer', 'object', 'fldinst', 'listtable', 'listoverridetable',
              'generator', 'expandedcolortbl'}
 _RTF_TOKEN = None
+_BRDR_STYLES = ('brdrs', 'brdrth', 'brdrdb', 'brdrdot', 'brdrdash', 'brdrhair', 'brdrdashsm', 'brdrdashd', 'brdrdashdd',
+                'brdrtriple', 'brdrdashdot', 'brdrdashdotdot')
+MIN_PAD_X = 2.0      # margen horizontal mínimo dentro de una celda (Cocoa exporta a veces \clpadl0: el texto tocaría el borde)
 
 def parse_rtf(blob):
     """RTF -> lista de bloques: ('p', párrafo) o ('row', fila).
        párrafo = {'runs': [(texto, fmt)], 'align', 'sa', 'sb', 'fs'}   fmt = {'size','color','b','i','u'}
-       fila    = {'cells': [{'paras': [...], 'w': ancho_pt}], 'left': pt, 'border': (color rgb | None, ancho_pt) | None}"""
+       fila    = {'cells': [celda], 'left': pt}
+       celda   = {'blocks': [bloques], 'w': ancho_pt, 'pad': (izq, der, arriba, abajo), 'va': 't'|'c'|'b',
+                  'borders': {'t'|'l'|'b'|'r': (color rgb | None, ancho_pt)}, 'shade': rgb | None}
+       Una celda contiene bloques, así que puede llevar TABLAS ANIDADAS (\\itap2, \\nestcell, \\nestrow) y celdas
+       combinadas (\\clmgf / \\clmrg)."""
     import re
     global _RTF_TOKEN
     if _RTF_TOKEN is None:
@@ -420,18 +455,16 @@ def parse_rtf(blob):
     s = s.decode('latin-1')
     fonts, colors = {}, []          # colors[0] = color automático (la tabla empieza con un ";" vacío)
     cs = dict(size=12.0, milli=None, cf=0, b=False, i=False, u=False, font=0, uc=1)
-    ps = dict(align='l', sa=0.0, sb=0.0, intbl=False)
+    ps = dict(align='l', sa=0.0, sb=0.0, intbl=False, itap=0)
     stack, dest = [], None
     blocks = []
     cur = []                       # runs del párrafo en curso
-    cell_paras, row_cells = [], []
-    rowdef = dict(left=0.0, cw=[], cx=[], border=None)
+    cell_blocks, row_cells, rowdef = {}, {}, {}      # por nivel de tabla (1 = tabla exterior, 2 = anidada...)
+    cdef, deflvl, bside = [None], [1], [None]
     pend = bytearray()
     pend_font = [0]
     cur_color = [None, None, None]
     cur_font = [None]
-    border_target = [None]
-    pending_cw = [None]
     skip_n = [0]
 
     def fmt():
@@ -462,7 +495,65 @@ def parse_rtf(blob):
         flush_bytes()
         p = dict(runs=list(cur), align=ps['align'], sa=ps['sa'], sb=ps['sb'], fs=fmt()['size'])
         cur.clear()
-        (cell_paras if ps['intbl'] else blocks).append(p if ps['intbl'] else ('p', p))
+        if ps['intbl'] and ps['itap'] >= 1:
+            cell_blocks.setdefault(ps['itap'], []).append(('p', p))
+        else:
+            blocks.append(('p', p))
+
+    def get_cdef():
+        if cdef[0] is None:
+            cdef[0] = dict(x=None, wpref=None, fts=None, mgf=False, mrg=False, va='t', borders={}, pad={}, shade=None)
+        return cdef[0]
+
+    def close_cell(lvl):
+        flush_bytes()
+        cb = cell_blocks.setdefault(lvl, [])
+        if cur or not (cb and cb[-1][0] == 'row'):       # tras una tabla anidada no se añade párrafo vacío
+            keep = (ps['intbl'], ps['itap']); ps['intbl'] = True; ps['itap'] = lvl
+            end_para()
+            ps['intbl'], ps['itap'] = keep
+        row_cells.setdefault(lvl, []).append(list(cell_blocks[lvl]))
+        cell_blocks[lvl] = []
+
+    def col_rgb(idx):
+        return colors[idx] if idx is not None and 0 <= idx < len(colors) else None
+
+    def close_row(lvl):
+        rd = rowdef.get(lvl) or dict(left=0.0, cells=[])
+        content = row_cells.get(lvl, [])
+        defs = rd['cells']
+        n = max(len(defs), len(content))
+        out, prevx = [], 0.0
+        for k in range(n):
+            d = defs[k] if k < len(defs) else None
+            cbl = content[k] if k < len(content) else []
+            x = d['x'] if d and d['x'] is not None else None
+            cw = (x - prevx) if x is not None else 40.0
+            if x is not None:
+                prevx = x
+            if d and d['mrg'] and out:           # celda combinada con la anterior: su ancho se suma, su contenido no se dibuja
+                out[-1]['span'] += cw
+                continue
+            out.append(dict(blocks=cbl, d=d, span=cw))
+        cells = []
+        for o in out:
+            d = o['d'] or {}
+            wpref = d.get('wpref')
+            w = wpref if (wpref and d.get('fts') in (3, None) and not d.get('mrg')) else o['span']
+            pd = d.get('pad') or {}
+            pl, pr = max(pd.get('l', CELL_PAD), MIN_PAD_X), max(pd.get('r', CELL_PAD), MIN_PAD_X)
+            bd = {}
+            for side, b in (d.get('borders') or {}).items():
+                if b:
+                    bd[side] = (col_rgb(b['cf']), b['w'])
+            cells.append(dict(blocks=o['blocks'], w=w, wx=o['span'], pad=(pl, pr, pd.get('t', 0.0), pd.get('b', 0.0)), va=d.get('va', 't'),
+                              borders=bd, shade=col_rgb(d['shade']) if d.get('shade') is not None else None))
+        row = dict(cells=cells, left=rd['left'])
+        if lvl <= 1:
+            blocks.append(('row', row)); ps['intbl'] = False; ps['itap'] = 0
+        else:
+            cell_blocks.setdefault(lvl - 1, []).append(('row', row))
+        row_cells[lvl] = []
 
     pos = 0
     skip_depth = None
@@ -540,7 +631,7 @@ def parse_rtf(blob):
         elif w == 'tab':
             flush_bytes(); add_text('    ')
         elif w == 'pard':
-            ps.update(align='l', sa=0.0, sb=0.0, intbl=False)
+            ps.update(align='l', sa=0.0, sb=0.0, intbl=False, itap=0)
         elif w == 'plain':
             cs.update(b=False, i=False, u=False, cf=0)
         elif w == 'f' and n is not None:
@@ -560,49 +651,112 @@ def parse_rtf(blob):
         elif w in ('ql', 'qj'): ps['align'] = 'l'
         elif w == 'sa' and n is not None: ps['sa'] = n / 20.0
         elif w == 'sb' and n is not None: ps['sb'] = n / 20.0
-        elif w == 'intbl': ps['intbl'] = True
+        elif w == 'intbl':
+            ps['intbl'] = True
+            if not ps['itap']: ps['itap'] = 1
+        elif w == 'itap' and n is not None: ps['itap'] = n
         elif w == 'u' and n is not None:
-            flush_bytes(); add_text(chr(n + 65536 if n < 0 else n))
+            flush_bytes(); ch = n + 65536 if n < 0 else n
+            if ch == 0x2028:
+                add_text('\n')                    # separador de línea (Mayús+Intro de Cocoa): salto de línea, no un carácter
+            elif ch == 0x2029:
+                end_para()
+            else:
+                add_text(chr(ch))
             skip_n[0] = cs['uc']          # \uN va seguido de \ucN caracteres de sustitución (Cocoa: \uc0 = ninguno)
         elif w == 'uc' and n is not None: cs['uc'] = n
-        # ---- tablas
+        # ---- tablas (con anidamiento: cada nivel \itapN tiene su propia definición de fila y su celda en curso)
         elif w == 'trowd':
-            rowdef = dict(left=0.0, cw=[], cx=[], border=None); row_cells = []; pending_cw[0] = None
-        elif w == 'trleft' and n is not None: rowdef['left'] = n / 20.0
-        elif w in ('clbrdrt', 'clbrdrl', 'clbrdrb', 'clbrdrr', 'trbrdrt', 'trbrdrl', 'trbrdrb', 'trbrdrr'):
-            border_target[0] = w
-        elif w == 'brdrs':
-            rowdef['border'] = rowdef['border'] or dict(cf=None, w=0.5)
-        elif w == 'brdrcf' and n is not None and rowdef['border'] and rowdef['border']['cf'] is None:
-            rowdef['border']['cf'] = n
-        elif w == 'brdrw' and n is not None and rowdef['border'] and not rowdef['border'].get('wset'):
-            rowdef['border']['w'] = n / 20.0; rowdef['border']['wset'] = True
-        elif w == 'clwWidth' and n is not None: pending_cw[0] = n / 20.0
+            lvl = max(ps['itap'], 1); deflvl[0] = lvl
+            rowdef[lvl] = dict(left=0.0, cells=[]); row_cells[lvl] = []; cdef[0] = None; bside[0] = None
+        elif w == 'trleft' and n is not None:
+            rowdef.setdefault(deflvl[0], dict(left=0.0, cells=[]))['left'] = n / 20.0
+        elif w in ('clbrdrt', 'clbrdrl', 'clbrdrb', 'clbrdrr'):
+            bside[0] = w[-1]; get_cdef()
+        elif w in ('trbrdrt', 'trbrdrl', 'trbrdrb', 'trbrdrr', 'trbrdrh', 'trbrdrv'):
+            bside[0] = None
+        elif w in _BRDR_STYLES and bside[0] and cdef[0] is not None:
+            cdef[0]['borders'][bside[0]] = dict(cf=None, w=0.5)
+        elif w in ('brdrnil', 'brdrnone') and bside[0] and cdef[0] is not None:
+            cdef[0]['borders'][bside[0]] = None
+        elif w == 'brdrcf' and n is not None and bside[0] and cdef[0] is not None and cdef[0]['borders'].get(bside[0]):
+            cdef[0]['borders'][bside[0]]['cf'] = n
+        elif w == 'brdrw' and n is not None and bside[0] and cdef[0] is not None and cdef[0]['borders'].get(bside[0]):
+            cdef[0]['borders'][bside[0]]['w'] = max(n / 20.0, 0.25)
+        elif w == 'clmgf': get_cdef()['mgf'] = True
+        elif w == 'clmrg': get_cdef()['mrg'] = True
+        elif w == 'clvertalc': get_cdef()['va'] = 'c'
+        elif w == 'clvertalb': get_cdef()['va'] = 'b'
+        elif w == 'clvertalt': get_cdef()['va'] = 't'
+        elif w == 'clwWidth' and n is not None: get_cdef()['wpref'] = n / 20.0
+        elif w == 'clftsWidth' and n is not None: get_cdef()['fts'] = n
+        elif w in ('clpadl', 'clpadr', 'clpadt', 'clpadb') and n is not None: get_cdef()['pad'][w[-1]] = n / 20.0
+        elif w == 'clcbpat' and n is not None: get_cdef()['shade'] = n
         elif w == 'cellx' and n is not None:
-            rowdef['cx'].append(n / 20.0); rowdef['cw'].append(pending_cw[0]); pending_cw[0] = None
+            d = get_cdef(); d['x'] = n / 20.0
+            rowdef.setdefault(deflvl[0], dict(left=0.0, cells=[]))['cells'].append(d); cdef[0] = None; bside[0] = None
         elif w == 'cell':
-            flush_bytes()
-            ps['intbl'] = True; end_para()
-            row_cells.append(dict(paras=list(cell_paras))); cell_paras.clear()
+            close_cell(1)
+        elif w == 'nestcell':
+            close_cell(max(ps['itap'], 2))
         elif w == 'row':
-            cw = []
-            prev = 0.0
-            for k, c_ in enumerate(rowdef['cw']):
-                x = rowdef['cx'][k]
-                cw.append(c_ if c_ else x - prev); prev = x
-            for k, cell in enumerate(row_cells):
-                cell['w'] = cw[k] if k < len(cw) else (cw[-1] if cw else 40.0)
-            b = rowdef['border']
-            if b:
-                ci = b['cf']
-                b = (colors[ci] if ci is not None and 0 <= ci < len(colors) else None, b['w'])
-            blocks.append(('row', dict(cells=list(row_cells), left=rowdef['left'], border=b)))
-            row_cells = []; ps['intbl'] = False
+            close_row(1)
+        elif w == 'nestrow':
+            close_row(max(ps['itap'], 2))
     if cur:
+        ps['intbl'] = False
         end_para()
     return blocks
 
-def _pdf_font(f):
+# ---- fuentes: Helvetica estándar solo cubre WinAnsi (cp1252); para ≤ ≥ → ² ₂ etc. se usa una TTF con Unicode si existe
+_FONT_FAMILIES = [
+    # (regular, negrita, cursiva, negrita cursiva)
+    ('/System/Library/Fonts/Supplemental/Arial.ttf', '/System/Library/Fonts/Supplemental/Arial Bold.ttf',
+     '/System/Library/Fonts/Supplemental/Arial Italic.ttf', '/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf'),
+    ('C:\\Windows\\Fonts\\arial.ttf', 'C:\\Windows\\Fonts\\arialbd.ttf', 'C:\\Windows\\Fonts\\ariali.ttf', 'C:\\Windows\\Fonts\\arialbi.ttf'),
+    ('/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+     '/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf', '/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf'),
+    ('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+     '/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf', '/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf'),
+    ('/Library/Fonts/Arial Unicode.ttf',) * 4,
+    ('/System/Library/Fonts/Supplemental/Arial Unicode.ttf',) * 4,
+    ('/System/Library/Fonts/Apple Symbols.ttf',) * 4,
+]
+_FONT_STYLE = {}   # nombre registrado -> (negrita, cursiva), para el SVG
+_FONTS = None      # lista de familias: [{'names': [4 nombres registrados], 'cmap': {codepoints}}]
+
+def _init_fonts():
+    global _FONTS
+    if _FONTS is not None:
+        return _FONTS
+    _FONTS = []
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except Exception:
+        return _FONTS
+    for fi, fam in enumerate(_FONT_FAMILIES):
+        if not os.path.isfile(fam[0]):
+            continue
+        names = []
+        try:
+            for si, path in enumerate(fam):
+                nm = 'PD-%d-%d' % (fi, si)
+                f = TTFont(nm, path if os.path.isfile(path) else fam[0])
+                pdfmetrics.registerFont(f)
+                names.append(nm); _FONT_STYLE[nm] = (bool(si & 1), bool(si & 2))
+            _FONTS.append({'names': names, 'cmap': set(f.face.charToGlyph.keys())})
+        except Exception:
+            continue
+    return _FONTS
+
+def _pdf_font(f, txt=None):
+    """Nombre de la fuente PDF para un formato y (opcionalmente) un texto: la primera familia con TTF que cubra TODOS
+       sus caracteres; si ninguna, Helvetica estándar (el texto se pasará por _latin)."""
+    si = (1 if f['b'] else 0) + (2 if f['i'] else 0)
+    for fam in _init_fonts():
+        if txt is None or all(ch.isspace() or ord(ch) in fam['cmap'] for ch in txt):
+            return fam['names'][si]
     return ('Helvetica-BoldOblique' if f['b'] and f['i'] else 'Helvetica-Bold' if f['b']
             else 'Helvetica-Oblique' if f['i'] else 'Helvetica')
 
@@ -610,42 +764,128 @@ def _latin(t):
     return t.encode('cp1252', 'replace').decode('cp1252')       # Helvetica estándar = WinAnsi
 
 def layout_para(p, width):
-    """Parte un párrafo en líneas. Cada línea = {'segs': [(texto, fmt, ancho)], 'w', 'h'}."""
+    """Parte un párrafo en líneas. Cada línea = {'segs': [(texto, fmt, ancho, fuente)], 'w', 'h'}."""
     import re
     from reportlab.pdfbase.pdfmetrics import stringWidth
-    words = []                       # (texto, fmt, ancho)
+    words = []                       # (texto, fmt, ancho, fuente)
     for txt, f in p['runs']:
-        for tok in re.findall(r'\s+|\S+', _latin(txt).replace('\u00a0', ' ')):
-            words.append((tok, f, stringWidth(tok, _pdf_font(f), f['size'])))
+        txt = re.sub(r'[^\S\n]', ' ', txt)                       # nbsp y otros espacios raros -> espacio normal
+        for tok in re.findall(r'\n|[^\S\n]+|\S+', txt):
+            fn = _pdf_font(f, tok)
+            if fn.startswith('Helvetica'):
+                tok = _latin(tok)
+            words.append((tok, f, stringWidth(tok, fn, f['size']), fn))
     lines, line, lw = [], [], 0.0
-    for tok, f, w in words:
+    for tok, f, w, fn in words:
         if tok == '\n':
             lines.append(line); line, lw = [], 0.0; continue
         if tok.isspace():
-            line.append((tok, f, w)); lw += w; continue
+            line.append((tok, f, w, fn)); lw += w; continue
         if line and lw + w > width + 1e-6:
             while line and line[-1][0].isspace():
                 line.pop()
             lines.append(line); line, lw = [], 0.0
-        line.append((tok, f, w)); lw += w
+        line.append((tok, f, w, fn)); lw += w
     lines.append(line)
     out = []
     for ln in lines:
         while ln and ln[-1][0].isspace():
             ln = ln[:-1]
-        size = max([f['size'] for _, f, _ in ln] or [p['fs']])
-        out.append(dict(segs=ln, w=sum(w for _, _, w in ln), h=LINE_HEIGHT * size, size=size))
+        size = max([f['size'] for _, f, _, _ in ln] or [p['fs']])
+        out.append(dict(segs=ln, w=sum(s[2] for s in ln), h=LINE_HEIGHT * size, size=size))
     return out
 
+def _blocks_height(bl, width):
+    h = 0.0
+    for kind, b in bl:
+        if kind == 'p':
+            h += b['sb'] + sum(l['h'] for l in layout_para(b, max(width, 1.0))) + b['sa']
+        else:
+            h += _row_layout(b, width, True)[1]
+    return h
+
+def _row_layout(row, avail, nested=False):
+    """Anchos finales de las celdas (se encogen si la tabla no cabe), altura de la fila y medidas de cada celda."""
+    # tabla exterior: anchos de \cellx (Pro Drafts la ajusta al ancho del cuadro); anidada: anchos preferidos (\clwWidth)
+    # Anchos: \\cellx (c['wx']) o preferidos \\clwWidth (c['w']). Cocoa a veces escribe \\cellx de relleno, todos iguales
+    # (p.ej. 24 pt por columna), mientras que los anchos reales estan en \\clwWidth: en ese caso mandan los preferidos y la
+    # tabla puede sobresalir del cuadro de texto, como en Pro Drafts (no se encoge).
+    cells_ = row['cells']
+    wx_ = [c.get('wx', c['w']) for c in cells_]
+    wp_ = [c['w'] for c in cells_]
+    uniform_wx = len(wx_) > 1 and max(wx_) - min(wx_) < 0.5
+    differ_wp = len(wp_) > 1 and max(wp_) - min(wp_) > 0.5
+    use_pref = nested or (uniform_wx and differ_wp)
+    ws = [max(w, 1.0) for w in (wp_ if use_pref else wx_)]
+    room = avail
+    tot = sum(ws)
+    if (nested or not use_pref) and tot > room + 0.5 and room > 1.0:
+        ws = [w * room / tot for w in ws]
+    infos, rowh = [], 0.0
+    for cell, w in zip(row['cells'], ws):
+        pl, pr, pt, pb = cell['pad']
+        ch = _blocks_height(cell['blocks'], max(w - pl - pr, 1.0))
+        infos.append((ch, pl, pr, pt, pb)); rowh = max(rowh, ch + pt + pb)
+    rowh += max([bw for cell in row['cells'] for s_, (_, bw) in cell['borders'].items() if s_ == 'b'] or [0.0])   # el borde inferior ocupa su grosor
+    return ws, rowh, infos
+
+def _draw_lines(c, lines, left, avail, top, align, ytop, rgb):
+    from reportlab.lib.colors import Color
+    yy = top
+    for ln in lines:
+        base = ytop - (yy + 0.77 * ln['h'])
+        off = {'l': 0.0, 'c': (avail - ln['w']) / 2, 'r': avail - ln['w']}[align]
+        px = left + off
+        for tok, f, tw, fn in ln['segs']:
+            col = rgb(f['color'])
+            c.setFillColor(Color(col[0], col[1], col[2])); c.setStrokeColor(Color(col[0], col[1], col[2]))
+            c.setFont(fn, f['size'])
+            c.drawString(px, base, tok)
+            if f['u']:
+                c.setLineWidth(f['size'] * 0.06); c.line(px, base - f['size'] * 0.12, px + tw, base - f['size'] * 0.12)
+            px += tw
+        yy += ln['h']
+    return yy
+
+def _draw_blocks(c, bl, left, width, top, ytop, rgb, nested=False):
+    for kind, b in bl:
+        if kind == 'p':
+            top += b['sb']
+            top = _draw_lines(c, layout_para(b, max(width, 1.0)), left, width, top, b['align'], ytop, rgb) + b['sa']
+        else:
+            top = _draw_row(c, b, left, width, top, ytop, rgb, nested)
+    return top
+
+def _draw_row(c, row, left, width, top, ytop, rgb, nested=False):
+    from reportlab.lib.colors import Color
+    ws, rowh, infos = _row_layout(row, width, nested)
+    xx = left
+    yb = ytop - (top + rowh)
+    for cell, w, (ch, pl, pr, pt, pb) in zip(row['cells'], ws, infos):
+        if cell['shade']:
+            c.setFillColor(Color(*rgb(cell['shade']))); c.rect(xx, yb, w, rowh, stroke=0, fill=1)
+        free = rowh - pt - pb - ch
+        off = {'t': 0.0, 'c': free / 2, 'b': free}.get(cell['va'], 0.0)
+        _draw_blocks(c, cell['blocks'], xx + pl, w - pl - pr, top + pt + max(off, 0.0), ytop, rgb, True)
+        for side, (bc, bw) in cell['borders'].items():
+            c.setStrokeColor(Color(*rgb(bc))); c.setLineWidth(max(bw, 0.3)); c.setLineCap(2)
+            if side == 'l': c.line(xx, yb, xx, yb + rowh)
+            elif side == 'r': c.line(xx + w, yb, xx + w, yb + rowh)
+            elif side == 't': c.line(xx, yb + rowh, xx + w, yb + rowh)
+            elif side == 'b': c.line(xx, yb, xx + w, yb)
+        xx += w
+    return top + rowh
+
 def draw_text_item(c, it):
-    """Dibuja un cuadro de texto RTF (con tablas) dentro de su marco, en coordenadas del lienzo."""
+    """Dibuja un cuadro de texto RTF (con tablas, también anidadas) dentro de su marco, en coordenadas del lienzo."""
     from reportlab.lib.colors import Color
     blocks = parse_rtf(it['rtf'])
     if not blocks:
         return
     x, y, w, h = it['frame']
+    w, h = it.get('bounds') or (w, h)           # el marco (frame) de un elemento girado es su caja envolvente; el tamaño real es 'bounds'
     a, b, cc, d, _, _ = it['tr']
-    cx, cy = it['center'] or (x + w / 2, y + h / 2)
+    cx, cy = it['center'] or (it['frame'][0] + it['frame'][2] / 2, it['frame'][1] + it['frame'][3] / 2)
 
     def rgb(col):
         r, g, b_ = col if col else (0.0, 0.0, 0.0)
@@ -659,75 +899,65 @@ def draw_text_item(c, it):
     c.translate(cx, -cy)
     c.transform(a, -b, -cc, d, 0, 0)
     ytop = h / 2                     # origen local: esquina superior izquierda del marco = (-w/2, h/2)
-    X0 = -w / 2 + TEXT_INSET
-    cursor = [TEXT_INSET]            # distancia desde el borde superior
-
-    def draw_lines(lines, left, avail, top, align):
-        yy = top
-        for ln in lines:
-            base = ytop - (yy + 0.77 * ln['h'])
-            off = {'l': 0.0, 'c': (avail - ln['w']) / 2, 'r': avail - ln['w']}[align]
-            px = left + off
-            for tok, f, tw in ln['segs']:
-                col = rgb(f['color'])
-                c.setFillColor(Color(col[0], col[1], col[2])); c.setStrokeColor(Color(col[0], col[1], col[2]))
-                c.setFont(_pdf_font(f), f['size'])
-                c.drawString(px, base, tok)
-                if f['u']:
-                    c.setLineWidth(f['size'] * 0.06); c.line(px, base - f['size'] * 0.12, px + tw, base - f['size'] * 0.12)
-                px += tw
-            yy += ln['h']
-        return yy
-
-    for kind, blk in blocks:
-        if kind == 'p':
-            cursor[0] += blk['sb']
-            lines = layout_para(blk, w - 2 * TEXT_INSET)
-            cursor[0] = draw_lines(lines, X0, w - 2 * TEXT_INSET, cursor[0], blk['align']) + blk['sa']
-        else:
-            cells = blk['cells']
-            laid, rowh = [], 0.0
-            for cell in cells:
-                hh, parts = 0.0, []
-                for p in cell['paras']:
-                    hh += p['sb']
-                    ls = layout_para(p, max(cell['w'] - 2 * CELL_PAD, 1.0))
-                    parts.append((p, ls, hh)); hh += sum(l['h'] for l in ls) + p['sa']
-                laid.append(parts); rowh = max(rowh, hh)
-            left = X0 + blk['left']
-            xx = left
-            bd = blk['border']
-            for cell, parts in zip(cells, laid):
-                if bd:
-                    c.setStrokeColor(Color(*rgb(bd[0]))); c.setLineWidth(max(bd[1], 0.3))
-                    c.rect(xx, ytop - (cursor[0] + rowh), cell['w'], rowh, stroke=1, fill=0)
-                for p, ls, off in parts:
-                    draw_lines(ls, xx + CELL_PAD, cell['w'] - 2 * CELL_PAD, cursor[0] + off, p['align'])
-                xx += cell['w']
-            cursor[0] += rowh
+    _draw_blocks(c, blocks, -w / 2 + TEXT_INSET, w - 2 * TEXT_INSET, TEXT_INSET_Y, ytop, rgb)
     c.restoreState()
 
 _IMG_CACHE = {}
 
 def load_image(path):
-    """Abre una imagen adjunta (PNG/JPEG/HEIC...) como PIL RGBA. None si no se puede leer."""
+    """Abre una imagen adjunta (PNG/JPEG/HEIC/PDF...) como PIL RGBA, con la orientación EXIF aplicada. None si no se puede leer.
+       Los PDF (contenido pegado como PDF, p.ej. una tabla copiada de una web) se rasterizan a ~220 ppp."""
     if path in _IMG_CACHE:
         return _IMG_CACHE[path]
-    from PIL import Image
+    from PIL import Image, ImageOps
     im = None
     try:
-        try:
-            im = Image.open(path); im.load()
-        except Exception:
-            im = None
-            if path.lower().endswith(('.heic', '.heif')):
-                im = _open_heic(path)
+        low = path.lower()
+        if low.endswith('.pdf'):
+            im = _open_pdf(path)
+        else:
+            try:
+                im = Image.open(path); im.load()
+            except Exception:
+                im = None
+                if low.endswith(('.heic', '.heif')):
+                    im = _open_heic(path)
         if im is not None:
+            try:
+                im = ImageOps.exif_transpose(im)       # fotos del iPhone: la orientación va en el EXIF, no en los píxeles
+            except Exception:
+                pass
             im = im.convert('RGBA')
     except Exception:
         im = None
     _IMG_CACHE[path] = im
     return im
+
+def _open_pdf(path, dpi=220):
+    """Primera página de un PDF adjunto -> imagen (pdftoppm, pypdfium2 o sips). None si no hay forma."""
+    import subprocess, shutil
+    from PIL import Image
+    tmpd = tempfile.mkdtemp(prefix='pdfimg_')
+    if shutil.which('pdftoppm'):
+        try:
+            subprocess.run(['pdftoppm', '-r', str(dpi), '-f', '1', '-l', '1', '-png', '-singlefile', path, os.path.join(tmpd, 'o')],
+                           check=True, capture_output=True)
+            im = Image.open(os.path.join(tmpd, 'o.png')); im.load(); return im
+        except Exception:
+            pass
+    try:
+        import pypdfium2 as pdfium
+        return pdfium.PdfDocument(path)[0].render(scale=dpi / 72.0).to_pil()
+    except Exception:
+        pass
+    if shutil.which('sips'):                                  # macOS
+        try:
+            out = os.path.join(tmpd, 'o.png')
+            subprocess.run(['sips', '-s', 'format', 'png', path, '--out', out], check=True, capture_output=True)
+            im = Image.open(out); im.load(); return im
+        except Exception:
+            pass
+    return None
 
 def _open_heic(path):
     import subprocess, shutil
@@ -763,11 +993,12 @@ def draw_image_item(c, it, root, H, ox, oy):
     im = load_image(next((q for q in (os.path.join(root, d, it['image']) for d in ('attachments', 'File')) if os.path.isfile(q)),
                          os.path.join(root, 'attachments', it['image'])))
     x, y, w, h = it['frame']
+    w, h = it.get('bounds') or (w, h)        # tamaño real: el frame de una imagen girada 90° tiene el ancho y el alto cambiados
     if im is None:
-        print("  aviso: no puedo leer la imagen %s (se omite)" % it['image'], file=sys.stderr)
+        print("  aviso: no puedo leer la imagen %s (se omite; para HEIC: pip install pillow-heif)" % it['image'], file=sys.stderr)
         return
     a, b, cc, d, _, _ = it['tr']
-    cx, cy = it['center'] or (x + w / 2, y + h / 2)
+    cx, cy = it['center'] or (it['frame'][0] + it['frame'][2] / 2, it['frame'][1] + it['frame'][3] / 2)
     c.saveState()
     try:
         c.setFillAlpha(it.get('alpha', 1.0))
@@ -820,6 +1051,7 @@ def draw_link_card(c, it, root=None):
     x, y, w, h = it['frame']
     a, b, cc, d, _, _ = it['tr']
     cx, cy = it['center'] or (x + w / 2, y + h / 2)
+    w, h = it.get('bounds') or (w, h)
     url = (it.get('url') or '').strip()
     icon = None
     if root and it.get('image'):
@@ -866,6 +1098,41 @@ def draw_link_card(c, it, root=None):
     if url and hasattr(c, 'end_link'):
         c.end_link()
 
+def draw_grid_item(c, it):
+    """Tabla de Pro Drafts (ZTYPE 9): borde exterior redondeado + divisiones de filas/columnas (gris claro por defecto)."""
+    from reportlab.lib.colors import Color
+    rows = it.get('grid')
+    if not rows:
+        return
+    x, y, w, h = it['frame']
+    w, h = it.get('bounds') or (w, h)
+    a, b, cc, d, _, _ = it['tr']
+    cx, cy = it['center'] or (it['frame'][0] + it['frame'][2] / 2, it['frame'][1] + it['frame'][3] / 2)
+    col = it.get('border') or (0.667, 0.667, 0.667, 1.0)
+    r_, g_, b_ = map_rgb(*col[:3])
+    lw = it.get('bw') or 1.0
+    rad = it.get('radius') or (14.0 if it.get('round') else 0.0)
+    rad = min(rad, w / 2, h / 2)
+    c.saveState()
+    c.translate(cx, -cy); c.transform(a, -b, -cc, d, 0, 0)
+    c.setStrokeColor(Color(r_, g_, b_, alpha=col[3] if len(col) > 3 else 1.0))
+    c.setLineWidth(lw); c.setLineCap(0)
+    if it.get('fill'):
+        fr, fg, fb, fa = it['fill']; c.setFillColor(Color(*map_rgb(fr, fg, fb), alpha=fa))
+    c.roundRect(-w / 2, -h / 2, w, h, rad, stroke=1, fill=1 if it.get('fill') else 0)
+    yy = h / 2
+    for ri, row in enumerate(rows):
+        rh = row[0][1] if row else 0
+        xx = -w / 2
+        for ci, (cw, _) in enumerate(row):
+            if ci > 0:
+                c.line(xx, yy, xx, yy - rh)               # divisor vertical
+            xx += cw
+        yy -= rh
+        if ri < len(rows) - 1:
+            c.line(-w / 2, yy, w / 2, yy)                 # divisor horizontal
+    c.restoreState()
+
 def draw_item(c, it, H, ox, oy):
     from reportlab.lib.colors import Color
     x, y, w, h = it['frame']
@@ -884,8 +1151,17 @@ def draw_item(c, it, H, ox, oy):
         r, g, b, a = it['fill']; r, g, b = map_rgb(r, g, b); c.setFillColor(Color(r, g, b, alpha=a))
     if it['stroke']:
         r, g, b, a = it['stroke']; r, g, b = map_rgb(r, g, b); c.setStrokeColor(Color(r, g, b, alpha=a)); c.setLineWidth(it['lw'])
-    c.roundRect(X, Y, w, h, min(it['radius'], w / 2, h / 2),
+    a, b_, cc, d_, _, _ = it['tr']
+    bw, bh = it.get('bounds') or (w, h)
+    if (a, b_, cc, d_) == (1, 0, 0, 1) and (bw, bh) == (w, h):
+        c.roundRect(X, Y, w, h, min(it['radius'], w / 2, h / 2),
+                    stroke=1 if it['stroke'] and it['lw'] else 0, fill=1 if it['fill'] else 0)
+        return
+    cx, cy = it['center'] or (x + w / 2, y + h / 2)       # forma girada / escalada: alrededor de su centro
+    c.saveState(); c.translate(cx - ox, H - (cy - oy)); c.transform(a, -b_, -cc, d_, 0, 0)
+    c.roundRect(-bw / 2, -bh / 2, bw, bh, min(it['radius'], bw / 2, bh / 2),
                 stroke=1 if it['stroke'] and it['lw'] else 0, fill=1 if it['fill'] else 0)
+    c.restoreState()
 
 # ---------------------------------------------------------------- paquete
 _PKG_CACHE = {}
@@ -1192,7 +1468,8 @@ class SvgCanvas:
     def drawString(self, x, y, text):
         name, size = self.st['font']
         fam = 'Helvetica, Arial, sans-serif'
-        extra = (' font-weight="bold"' if 'Bold' in name else '') + (' font-style="italic"' if 'Oblique' in name or 'Italic' in name else '')
+        bd_, it_ = _FONT_STYLE.get(name, (False, False))
+        extra = (' font-weight="bold"' if 'Bold' in name or bd_ else '') + (' font-style="italic"' if 'Oblique' in name or 'Italic' in name or it_ else '')
         t = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         op = '' if self.st['fa'] >= 0.999 else ' fill-opacity="%.3f"' % self.st['fa']
         self.out.append('<text transform="matrix(%s)" x="%s" y="%s" font-family="%s" font-size="%s"%s fill="%s"%s xml:space="preserve">%s</text>'
@@ -1270,7 +1547,7 @@ def convert(src, out):
         # caiga fuera de la página no existe en el documento (no se reduce ni se recentra nada).
         if legacy:
             # lienzo infinito sin PDF de fondo: la página es la caja que ocupa el contenido (+ margen)
-            items = [it for it in items if it.get('image') or it.get('rtf') or it.get('line') or it.get('fill') or it.get('stroke')]
+            items = [it for it in items if it.get('image') or it.get('rtf') or it.get('grid') or it.get('line') or it.get('fill') or it.get('stroke')]
             xs = [p[0] for s in strokes for p in s['pts']] + [v for it in items for v in (it['frame'][0], it['frame'][0] + it['frame'][2])]
             ys = [p[1] for s in strokes for p in s['pts']] + [v for it in items for v in (it['frame'][1], it['frame'][1] + it['frame'][3])]
             M = 24.0
@@ -1296,6 +1573,8 @@ def convert(src, out):
         for it in items:
             if it.get('type') == 13 and (it.get('title') or it.get('url')):
                 draw_link_card(c, it, root)
+            elif it.get('grid'):
+                draw_grid_item(c, it)
             elif it.get('image'):
                 draw_image_item(c, it, root, 0, 0, 0)
             else:
