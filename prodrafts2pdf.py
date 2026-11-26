@@ -14,6 +14,7 @@ Uso:
 
 Carpeta con muchas notas (modo carpeta): python3 prodrafts2pdf.py CARPETA --out-dir DESTINO [--skip-existing]
 convierte cada .prodrafts / .zip de CARPETA (solo lectura) y recrea el árbol de carpetas de la biblioteca bajo DESTINO.
+Con -r / --recursive el modo carpeta busca también en todas las subcarpetas de CARPETA.
 Las notas que no han cambiado desde la última exportación (huella en DESTINO/.prodrafts2pdf.json) no se re-exportan; --force lo fuerza.
 
 Las notas de lienzo infinito (formato antiguo de Pro Drafts, sin PDF de fondo) salen como SVG vectorial (.svg); el resto como PDF
@@ -1646,20 +1647,50 @@ def unchanged(m, key, fp, out, out_dir):
     e = m.get(key)
     return bool(e and e.get('fp') == fp and e.get('out') == os.path.relpath(out, out_dir) and os.path.isfile(out))
 
-def is_batch_dir(src):
+def _is_unpacked_note(path):
+    return any(os.path.isfile(os.path.join(path, f)) for f in ('pageIndex.plist', 'draw.data'))
+
+def _maybe_note_zip(path):
+    """False solo si es un .zip legible que NO contiene una nota (al recorrer subcarpetas hay zips ajenos).
+       Los zips dañados se mantienen para que aparezcan como fallos."""
+    if not path.lower().endswith('.zip'):
+        return True
+    try:
+        with zipfile.ZipFile(path) as z:
+            return any(n.rsplit('/', 1)[-1] in ('pageIndex.plist', 'draw.data') for n in z.namelist())
+    except Exception:
+        return True
+
+def find_notes(src, recursive=False):
+    """Rutas relativas a src de las notas (.prodrafts, archivo o carpeta, y .zip), ordenadas."""
+    def is_name(n):
+        return not n.startswith('.') and (n.endswith('.prodrafts') or n.lower().endswith('.zip'))
+    if not recursive:
+        return sorted(n for n in os.listdir(src) if is_name(n))
+    found = []
+    for dp, dn, fn in os.walk(src):
+        # las carpetas .prodrafts son notas: se convierten, no se recorren por dentro
+        found += [os.path.join(dp, d) for d in dn if not d.startswith('.') and d.endswith('.prodrafts')]
+        dn[:] = [d for d in dn if not d.startswith('.') and d != '__MACOSX' and not d.endswith('.prodrafts')
+                 and not _is_unpacked_note(os.path.join(dp, d))]
+        found += [os.path.join(dp, n) for n in fn if is_name(n) and _maybe_note_zip(os.path.join(dp, n))]
+    return sorted(os.path.relpath(f, src) for f in found)
+
+def is_batch_dir(src, recursive=False):
     """Carpeta con varios .prodrafts / .zip dentro (y que no es ella misma una nota)."""
     if not os.path.isdir(src) or os.path.normpath(src).endswith('.prodrafts'):
         return False
-    if os.path.isfile(os.path.join(src, 'pageIndex.plist')):
+    if _is_unpacked_note(src):
         return False
-    return any(n.endswith('.prodrafts') or n.lower().endswith('.zip') for n in os.listdir(src))
+    return bool(find_notes(src, recursive))
 
-def convert_all(src, out_dir, db=None, skip_existing=False, force=False):
-    notes = sorted(n for n in os.listdir(src) if (n.endswith('.prodrafts') or n.lower().endswith('.zip')) and not n.startswith('.'))
+def convert_all(src, out_dir, db=None, skip_existing=False, force=False, recursive=False):
+    notes = find_notes(src, recursive)
     ok, fail, skipped, orphan, renamed = 0, [], 0, 0, 0
     real_src, real_out = os.path.realpath(src), os.path.realpath(out_dir)
     if real_out == real_src or real_out.startswith(real_src + os.sep) or real_src.startswith(real_out + os.sep):
         sys.exit("--out-dir (%s) no puede estar dentro de la carpeta de origen ni contenerla" % out_dir)
+    seen_keys = set()
     manifest = load_manifest(out_dir)
     used = set()                       # rutas ya asignadas en esta ejecución (sin distinguir mayúsculas, como macOS)
     for i, n in enumerate(notes, 1):
@@ -1671,7 +1702,8 @@ def convert_all(src, out_dir, db=None, skip_existing=False, force=False):
             out = os.path.join(out_dir, *info[0], info[1] + ext)
         else:
             orphan += 1
-            out = os.path.join(out_dir, '_sin_biblioteca', (uid or n) + ext)
+            # sin nombre en la biblioteca: se conserva la subcarpeta de origen
+            out = os.path.join(out_dir, '_sin_biblioteca', os.path.dirname(n), (uid or os.path.basename(n)) + ext)
         base, k = os.path.splitext(out)[0], 1
         while out.lower() in used:     # dos notas con el mismo nombre en la misma carpeta: no se pisan
             k += 1; out = '%s (%d)%s' % (base, k, ext)
@@ -1682,6 +1714,9 @@ def convert_all(src, out_dir, db=None, skip_existing=False, force=False):
         if skip_existing and os.path.isfile(out):
             skipped += 1; continue
         key = uid or n
+        if key in seen_keys:           # la misma nota copiada en varias subcarpetas: cada copia lleva su registro
+            key = '%s|%s' % (key, n)
+        seen_keys.add(key)
         fp = fingerprint(path)
         if not force and unchanged(manifest, key, fp, out, out_dir):
             print("  sin cambios, no se vuelve a exportar"); skipped += 1; continue
@@ -1708,6 +1743,7 @@ if __name__ == '__main__':
     ap.add_argument('--out-dir', default='.', help='carpeta raíz donde crear el PDF cuando no se da salida (por defecto: la actual)')
     ap.add_argument('--force', action='store_true', help='re-exportar aunque la nota no haya cambiado')
     ap.add_argument('--skip-existing', action='store_true', help='(modo carpeta) no rehacer los PDF que ya existen')
+    ap.add_argument('-r', '--recursive', action='store_true', help='(modo carpeta) buscar notas también en las subcarpetas')
     ap.add_argument('--db', default=None, help='MainDrawBoardFile.sqlite de Pro Drafts (por defecto: el del contenedor de macOS)')
     ap.add_argument('--width', type=float, default=None, help='factor de grosor (por defecto %.2f)' % WIDTH_SCALE)
     ap.add_argument('--canvas-scale', type=float, default=None, help='escala lienzo->página (por defecto %.2f)' % CANVAS_SCALE)
@@ -1724,10 +1760,10 @@ if __name__ == '__main__':
             faltan.append(pkg)
     if faltan:
         sys.exit("Faltan dependencias para %s. Instálalas con:\n    %s -m pip install %s" % (sys.executable, sys.executable, ' '.join(faltan)))
-    if is_batch_dir(a.src):
+    if is_batch_dir(a.src, a.recursive):
         if a.out:
             sys.exit("En modo carpeta no se da fichero de salida: usa --out-dir")
-        convert_all(a.src, a.out_dir, a.db, a.skip_existing, a.force); sys.exit(0)
+        convert_all(a.src, a.out_dir, a.db, a.skip_existing, a.force, a.recursive); sys.exit(0)
     out = a.out or default_out(a.src, a.out_dir, a.db, note_ext(a.src))
     track = not a.out                      # con salida explícita se exporta siempre
     if track:
