@@ -24,6 +24,8 @@ Sin 'salida.pdf': el PDF se llama como la nota en Pro Drafts (no el UUID) y se g
 que tiene en la biblioteca, bajo --out-dir (por defecto, el directorio actual). El nombre y las carpetas salen de
 MainDrawBoardFile.sqlite (tabla ZBOARDFILE) del contenedor de Pro Drafts; se trabaja sobre una COPIA temporal,
 nunca se abre ni se modifica el original. El UUID de la nota se toma del nombre del .zip / .prodrafts.
+Export por WebDAV: el fichero se llama como el documento (sin UUID) y trae dentro prodrafts-backup.json con uuid, name y folders.
+De ahí se saca el UUID y, si la nota no está en la biblioteca, también el nombre y las carpetas (_sin_biblioteca/ solo si no hay ni una cosa ni la otra).
 
 Dependencias: pip install reportlab pypdf pillow   (HEIC: pillow-heif, o sips en macOS / heif-convert, ImageMagick o ffmpeg en Linux)
 """
@@ -1276,9 +1278,41 @@ import re as _re
 _UUID_RE = _re.compile(r'[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}')
 DEFAULT_DB = os.path.expanduser('~/Library/Containers/emmo.prodrafts/Data/Library/Application Support/Prodrafts/MainDrawBoardFile.sqlite')
 
+_META_CACHE = {}
+
+def backup_meta(src):
+    """Metadatos de prodrafts-backup.json ({uuid, name, folders, noteType, ...}) que lleva dentro la nota exportada por WebDAV
+       (el .prodrafts se llama como el documento, sin UUID). Sirve para .zip/.prodrafts comprimidos y para carpetas. None si no hay."""
+    import json
+    if src in _META_CACHE:
+        return _META_CACHE[src]
+    meta, raw = None, None
+    try:
+        if os.path.isdir(src):
+            for cand in [os.path.join(src, 'prodrafts-backup.json')] + sorted(glob.glob(os.path.join(src, '*', 'prodrafts-backup.json'))):
+                if os.path.isfile(cand) and '__MACOSX' not in cand:
+                    raw = open(cand, 'rb').read(); break
+        elif zipfile.is_zipfile(src):
+            with zipfile.ZipFile(src) as z:
+                for n in z.namelist():
+                    if n.rsplit('/', 1)[-1] == 'prodrafts-backup.json' and '__MACOSX' not in n:
+                        raw = z.read(n); break
+        if raw:
+            d = json.loads(raw.decode('utf8'))
+            if isinstance(d, dict) and isinstance(d.get('uuid'), str) and _UUID_RE.fullmatch(d['uuid']):
+                meta = d
+    except Exception:
+        meta = None
+    _META_CACHE[src] = meta
+    return meta
+
 def note_uuid(src):
+    """UUID de la nota: del nombre del fichero (export normal) o, si no lo lleva (export WebDAV), de prodrafts-backup.json."""
     m = _UUID_RE.search(os.path.basename(os.path.normpath(src)))
-    return m.group(0).upper() if m else None
+    if m:
+        return m.group(0).upper()
+    meta = backup_meta(src)
+    return meta['uuid'].upper() if meta else None
 
 def safe_name(s):
     s = _re.sub(r'[\\/:\x00-\x1f]', '-', s or '').strip().lstrip('.').strip()
@@ -1321,9 +1355,22 @@ def _load_library(db):
     _LIB_CACHE[db] = res
     return res
 
-def library_path(uuid_str, db=None):
-    """(lista de carpetas de fuera a dentro, nombre de la nota) según la biblioteca, o None si no se encuentra.
-       Trabaja sobre una copia temporal de la base de datos: el original no se toca."""
+def meta_path(src):
+    """(carpetas, nombre) según prodrafts-backup.json de la propia nota (export WebDAV), o None."""
+    meta = backup_meta(src) if src else None
+    name = safe_name(meta.get('name')) if meta and isinstance(meta.get('name'), str) else ''
+    if not name:
+        return None
+    folders = [safe_name(f) for f in (meta.get('folders') or []) if isinstance(f, str) and safe_name(f)]
+    return folders, name
+
+def library_path(uuid_str, db=None, src=None):
+    """(lista de carpetas de fuera a dentro, nombre de la nota), o None si no se encuentra.
+       1) biblioteca de Pro Drafts (MainDrawBoardFile.sqlite, copia temporal; el original no se toca), 2) si no está ahí,
+       prodrafts-backup.json de la propia nota (export WebDAV)."""
+    return _library_path_db(uuid_str, db) or meta_path(src)
+
+def _library_path_db(uuid_str, db=None):
     lib = _load_library(db or DEFAULT_DB) if uuid_str else None
     if not lib:
         return None
@@ -1347,7 +1394,7 @@ def library_path(uuid_str, db=None):
 
 def default_out(src, out_dir, db=None, ext='.pdf'):
     uid = note_uuid(src)
-    info = library_path(uid, db)
+    info = library_path(uid, db, src)
     if info:
         folders, name = info
         return os.path.join(out_dir or '.', *folders, name + ext)
@@ -1355,7 +1402,7 @@ def default_out(src, out_dir, db=None, ext='.pdf'):
     for suf in ('.zip', '.prodrafts', '_prodrafts'):
         if base.lower().endswith(suf):
             base = base[:-len(suf)]
-    print("aviso: no encuentro la nota en la biblioteca de Pro Drafts (--db); uso '%s%s'" % (uid or base, ext), file=sys.stderr)
+    print("aviso: no encuentro la nota en la biblioteca de Pro Drafts (--db) ni prodrafts-backup.json dentro de la nota; uso '%s%s'" % (uid or base, ext), file=sys.stderr)
     return os.path.join(out_dir or '.', (uid or base) + ext)
 
 # ---------------------------------------------------------------- lienzo SVG (notas de lienzo infinito)
@@ -1617,14 +1664,26 @@ def fingerprint(src):
         with open(path, 'rb') as f:
             for blk in iter(lambda: f.read(1 << 20), b''):
                 h.update(blk)
+    SKIP = ('.DS_Store', 'prodrafts-backup.json')      # el backup.json lleva createdAt, que cambia en cada export
     if os.path.isdir(src):
         for dp, dn, fn in os.walk(src):
             dn[:] = sorted(d for d in dn if d != 'search')
             for n in sorted(fn):
-                if n == '.DS_Store':
+                if n in SKIP:
                     continue
                 full = os.path.join(dp, n)
                 h.update(os.path.relpath(full, src).encode('utf8', 'replace')); feed(full)
+    elif zipfile.is_zipfile(src):
+        # por contenido de los miembros (no del .zip): re-exportar por WebDAV sin tocar la nota no cambia la huella
+        with zipfile.ZipFile(src) as z:
+            for zi in sorted(z.infolist(), key=lambda i: i.filename):
+                parts = zi.filename.split('/')
+                if zi.is_dir() or '__MACOSX' in parts or 'search' in parts[:-1] or parts[-1] in SKIP:
+                    continue
+                h.update(zi.filename.encode('utf8', 'replace'))
+                with z.open(zi) as f:
+                    for blk in iter(lambda: f.read(1 << 20), b''):
+                        h.update(blk)
     else:
         feed(src)
     return h.hexdigest()
@@ -1696,13 +1755,13 @@ def convert_all(src, out_dir, db=None, skip_existing=False, force=False, recursi
     for i, n in enumerate(notes, 1):
         path = os.path.join(src, n)
         uid = note_uuid(path)
-        info = library_path(uid, db)
+        info = library_path(uid, db, path)
         ext = note_ext(path)
         if info:
             out = os.path.join(out_dir, *info[0], info[1] + ext)
         else:
             orphan += 1
-            # sin nombre en la biblioteca: se conserva la subcarpeta de origen
+            # sin nombre en la biblioteca ni en prodrafts-backup.json: se conserva la subcarpeta de origen
             out = os.path.join(out_dir, '_sin_biblioteca', os.path.dirname(n), (uid or os.path.basename(n)) + ext)
         base, k = os.path.splitext(out)[0], 1
         while out.lower() in used:     # dos notas con el mismo nombre en la misma carpeta: no se pisan
@@ -1732,7 +1791,7 @@ def convert_all(src, out_dir, db=None, skip_existing=False, force=False, recursi
             save_manifest(out_dir, manifest)
         except (Exception, SystemExit) as e:
             fail.append((n, str(e))); print("  ERROR en %s: %s" % (n, e), file=sys.stderr)
-    print("\nHecho: %d exportados, %d omitidos (sin cambios), %d fallos, %d sin nombre en la biblioteca (en _sin_biblioteca/), %d renombrados por nombre repetido" % (ok, skipped, len(fail), orphan, renamed))
+    print("\nHecho: %d exportados, %d omitidos (sin cambios), %d fallos, %d sin nombre (ni en la biblioteca ni en prodrafts-backup.json; en _sin_biblioteca/), %d renombrados por nombre repetido" % (ok, skipped, len(fail), orphan, renamed))
     for n, e in fail:
         print("  fallo: %s: %s" % (n, e), file=sys.stderr)
 
